@@ -1,8 +1,8 @@
 import streamlit as st
-import anthropic
+from groq import Groq
 import json
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Meeting → Action Pipeline",
     page_icon="📋",
@@ -12,9 +12,7 @@ st.set_page_config(
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .main { max-width: 780px; }
     .block-container { padding-top: 2rem; }
-
     .section-header {
         font-size: 15px; font-weight: 600; margin: 1.2rem 0 0.5rem;
         padding-bottom: 4px; border-bottom: 1px solid #e5e7eb;
@@ -28,14 +26,13 @@ st.markdown("""
         display: inline-block; font-size: 11px; font-weight: 600;
         padding: 2px 8px; border-radius: 20px; margin-right: 4px;
     }
-    .badge-owner  { background: #dbeafe; color: #1e40af; }
-    .badge-due    { background: #fef3c7; color: #92400e; }
-    .badge-high   { background: #fee2e2; color: #991b1b; }
-    .badge-medium { background: #fef3c7; color: #92400e; }
-    .badge-low    { background: #dcfce7; color: #166534; }
-    .badge-noowner{ background: #fee2e2; color: #991b1b; }
-    .badge-blocker{ background: #fee2e2; color: #991b1b; }
-
+    .badge-owner   { background: #dbeafe; color: #1e40af; }
+    .badge-due     { background: #fef3c7; color: #92400e; }
+    .badge-high    { background: #fee2e2; color: #991b1b; }
+    .badge-medium  { background: #fef3c7; color: #92400e; }
+    .badge-low     { background: #dcfce7; color: #166534; }
+    .badge-noowner { background: #fee2e2; color: #991b1b; }
+    .badge-blocker { background: #fee2e2; color: #991b1b; }
     .escalation-box {
         background: #fffbeb; border: 1px solid #f59e0b;
         border-radius: 8px; padding: 12px 16px; margin-top: 1rem;
@@ -53,10 +50,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ────────────────────────────────────────────────────────────────────
-st.title("📋 Meeting → Action Pipeline")
-st.markdown("Paste a messy meeting transcript — get decisions, action items, owners, and blockers.")
-st.divider()
+# ── Load API key from Streamlit Secrets ───────────────────────────────────────
+try:
+    api_key = st.secrets["GROQ_API_KEY"]
+except Exception:
+    st.error("⚠️ API key not configured. Please add GROQ_API_KEY to Streamlit Secrets.")
+    st.stop()
 
 # ── Sample transcript ─────────────────────────────────────────────────────────
 SAMPLE = """[Recording starts mid-conversation]
@@ -79,7 +78,8 @@ Sarah: When does Lisa come back?
 
 Priya: Thursday I think?
 
-Sarah: Okay so Priya follows up with Lisa Thursday. If not responded by EOD Thursday, escalate to me. If no sign-off by next Monday we decide whether to cut the feature.
+Sarah: Okay so Priya follows up with Lisa Thursday. If not responded by EOD Thursday, escalate to me.
+If no sign-off by next Monday we decide whether to cut the feature.
 
 Dev: There's also the mobile bug — app crashes on Android 12. Three enterprise customers reported it. High priority.
 
@@ -97,25 +97,30 @@ Mark: HR said budget freeze. Unresolved, we need a leadership decision before we
 
 Sarah: I'll raise it in the exec meeting Friday."""
 
-# ── API Key input ─────────────────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
+st.title("📋 Meeting → Action Pipeline")
+st.markdown("Paste a messy meeting transcript — get decisions, action items, owners, and blockers.")
+st.divider()
+
+# ── Sidebar info only (no API key input) ──────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    api_key = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        placeholder="sk-ant-...",
-        help="Get your key at console.anthropic.com"
-    )
-    st.markdown("---")
-    st.markdown("**How it works**")
+    st.header("ℹ️ How it works")
     st.markdown("""
-1. Paste meeting transcript
-2. AI extracts decisions, action items, owners, deadlines
-3. Flags blockers & escalations
-4. Copy output to Slack or email
+1. Paste your meeting transcript
+2. Click **Process transcript**
+3. Get decisions, action items, owners, deadlines
+4. Download Slack or email summary
     """)
     st.markdown("---")
-    st.caption("Built with Claude claude-sonnet-4-20250514 + Streamlit")
+    st.markdown("**What it detects**")
+    st.markdown("""
+- ✅ Action items with owners
+- 🎯 Decisions made
+- ❓ Unresolved questions
+- ⚠️ Escalations needed
+    """)
+    st.markdown("---")
+    st.caption("Powered by Groq + LLaMA 3.3 70B")
 
 # ── Transcript input ──────────────────────────────────────────────────────────
 col1, col2 = st.columns([3, 1])
@@ -123,12 +128,14 @@ with col1:
     st.markdown("#### Paste your transcript")
 with col2:
     if st.button("Load sample", use_container_width=True):
-        st.session_state["transcript"] = SAMPLE
+        st.session_state["load_sample"] = True
+
+default_text = SAMPLE if st.session_state.get("load_sample") else ""
 
 transcript = st.text_area(
     label="transcript",
     label_visibility="collapsed",
-    value=st.session_state.get("transcript", ""),
+    value=default_text,
     placeholder="Paste raw meeting transcript here — messy, with crosstalk, incomplete sentences — all fine...",
     height=220,
     key="transcript_input"
@@ -138,7 +145,7 @@ process_btn = st.button("▶  Process transcript", type="primary", use_container
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a meeting intelligence assistant. Extract structured data from meeting transcripts.
-Return ONLY valid JSON, no markdown, no explanation. Use this exact schema:
+Return ONLY valid JSON, no markdown, no explanation, no code blocks. Use this exact schema:
 
 {
   "summary": "2-3 sentence meeting summary",
@@ -160,10 +167,11 @@ Return ONLY valid JSON, no markdown, no explanation. Use this exact schema:
 }
 
 Rules:
-- Extract only what is explicitly stated or clearly implied. Do not invent.
-- If transcript is too short or noisy to extract reliably, set confidence to low.
+- Extract only what is explicitly stated or clearly implied. Do not invent anything.
+- If transcript is too short or noisy, set confidence to low.
 - Mark escalations for: unresolved budget decisions, missing owners on critical tasks, anything needing leadership input.
-- Keep all text concise (1 sentence max per item)."""
+- Keep all text concise, 1 sentence max per item.
+- Return raw JSON only. No markdown. No backticks. No explanation."""
 
 # ── Helper renderers ──────────────────────────────────────────────────────────
 def badge(text, cls):
@@ -177,7 +185,6 @@ def render_action_items(items):
         priority = a.get("priority", "medium")
         owner    = a.get("owner")
         due      = a.get("due")
-
         badges = ""
         if owner:
             badges += badge(f"👤 {owner}", "owner")
@@ -185,8 +192,7 @@ def render_action_items(items):
             badges += badge("⚠ no owner", "noowner")
         if due:
             badges += badge(f"📅 {due}", "due")
-        badges += badge(priority + " priority", priority)
-
+        badges += badge(f"{priority} priority", priority)
         st.markdown(f"""
         <div class="item-card">
             <div class="item-text">{a['text']}</div>
@@ -221,11 +227,10 @@ def render_escalations(items):
     if not items:
         return
     st.markdown('<div class="section-header">⚠️ Needs Human Judgment</div>', unsafe_allow_html=True)
-    with st.container():
-        st.markdown('<div class="escalation-box">', unsafe_allow_html=True)
-        for e in items:
-            st.markdown(f"• {e}")
-        st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div class="escalation-box">', unsafe_allow_html=True)
+    for e in items:
+        st.markdown(f"• {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 def build_slack_text(d):
     lines = [f"*📋 Meeting Summary*\n{d.get('summary', '')}"]
@@ -275,33 +280,38 @@ def build_email_text(d):
 
 # ── Main processing ───────────────────────────────────────────────────────────
 if process_btn:
-    text = st.session_state.get("transcript_input", transcript).strip()
+    text = transcript.strip()
 
     if not text:
         st.error("Please paste a meeting transcript first.")
-    elif not api_key:
-        st.error("Please enter your Anthropic API key in the sidebar.")
     else:
         with st.spinner("Analyzing transcript..."):
             try:
-                client = anthropic.Anthropic(api_key=api_key)
-                message = client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                client = Groq(api_key=api_key)
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user",   "content": f"Transcript:\n\n{text}"}
+                    ],
+                    temperature=0.1,
                     max_tokens=1024,
-                    system=SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": f"Transcript:\n\n{text}"}]
                 )
-                raw = message.content[0].text
+                raw   = response.choices[0].message.content
                 clean = raw.replace("```json", "").replace("```", "").strip()
-                data = json.loads(clean)
+                data  = json.loads(clean)
                 st.session_state["result"] = data
 
             except json.JSONDecodeError:
-                st.error("Couldn't parse the AI response. The transcript may be too short or ambiguous.")
-            except anthropic.AuthenticationError:
-                st.error("Invalid API key. Please check your key in the sidebar.")
+                st.error("Could not parse the AI response. Try again or simplify the transcript.")
             except Exception as e:
-                st.error(f"Something went wrong: {str(e)}")
+                err = str(e)
+                if "401" in err or "invalid_api_key" in err.lower():
+                    st.error("Invalid API key in Streamlit Secrets. Please check GROQ_API_KEY.")
+                elif "429" in err:
+                    st.error("Rate limit hit. Please wait a moment and try again.")
+                else:
+                    st.error(f"Something went wrong: {err}")
 
 # ── Render results ────────────────────────────────────────────────────────────
 if "result" in st.session_state:
@@ -309,11 +319,9 @@ if "result" in st.session_state:
 
     st.divider()
 
-    # Participants
     if d.get("participants"):
         st.caption("👥 Participants: " + ", ".join(d["participants"]))
 
-    # Confidence warning
     if d.get("confidence") in ("low", "medium"):
         note = d.get("confidence_note", "")
         st.markdown(
@@ -322,17 +330,14 @@ if "result" in st.session_state:
             unsafe_allow_html=True
         )
 
-    # Summary
     if d.get("summary"):
         st.markdown(f'<div class="summary-box">{d["summary"]}</div>', unsafe_allow_html=True)
 
-    # Sections
     render_action_items(d.get("action_items", []))
     render_decisions(d.get("decisions", []))
     render_unresolved(d.get("unresolved", []))
     render_escalations(d.get("escalations", []))
 
-    # Export
     st.divider()
     st.markdown("#### 📤 Export")
     col_slack, col_email = st.columns(2)
@@ -345,7 +350,6 @@ if "result" in st.session_state:
             mime="text/plain",
             use_container_width=True
         )
-
     with col_email:
         st.download_button(
             label="⬇ Download email summary",
